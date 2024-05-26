@@ -35,8 +35,13 @@ media_files = {
     }
 }
 
+# Global variable to keep track of the audio stream and thread
+current_audio_thread = None
+stop_audio_flag = False
+
 # Audio playback setup
 def play_audio(file):
+    global stop_audio_flag
     wf = wave.open(file, 'rb')
     stream = p.open(format=p.get_format_from_width(wf.getsampwidth()),
                     channels=wf.getnchannels(),
@@ -44,7 +49,7 @@ def play_audio(file):
                     output=True)
 
     data = wf.readframes(1024)
-    while data:
+    while data and not stop_audio_flag:
         stream.write(data)
         data = wf.readframes(1024)
 
@@ -52,8 +57,17 @@ def play_audio(file):
     stream.close()
 
 def play_audio_thread(file):
-    audio_thread = threading.Thread(target=play_audio, args=(file,))
-    audio_thread.start()
+    global stop_audio_flag, current_audio_thread
+    stop_audio_flag = False
+    current_audio_thread = threading.Thread(target=play_audio, args=(file,))
+    current_audio_thread.start()
+
+def stop_audio():
+    global stop_audio_flag, current_audio_thread
+    stop_audio_flag = True
+    if current_audio_thread and current_audio_thread.is_alive():
+        current_audio_thread.join()
+    stop_audio_flag = False
 
 # ArUco marker setup
 dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_6X6_250)
@@ -68,45 +82,31 @@ if not os.path.exists(output_dir):
 num_markers = len(media_files)
 
 for marker_id, files in media_files.items():
-    images = files["images"]
-    sounds = files["sounds"]
-    for idx, (img_path, sound_path) in enumerate(zip(images, sounds)):
-        marker_image = cv2.aruco.generateImageMarker(dictionary, marker_id, 700)
-        bordered_marker = np.ones((1500, 1500), dtype=np.uint8) * 255  # White background
-        bordered_marker[400:1100, 400:1100] = marker_image  # Overlay marker onto white background
-        marker_path = os.path.join(output_dir, f"marker_{marker_id}_{idx+1}.png")
-        cv2.imwrite(marker_path, bordered_marker)
-        print(f"Marker ID {marker_id}_{idx+1} saved as {marker_path}")
+    marker_image = cv2.aruco.generateImageMarker(dictionary, marker_id, 700)
+    bordered_marker = np.ones((1500, 1500), dtype=np.uint8) * 255  # White background
+    bordered_marker[400:1100, 400:1100] = marker_image  # Overlay marker onto white background
+    marker_path = os.path.join(output_dir, f"marker_{marker_id}.png")
+    cv2.imwrite(marker_path, bordered_marker)
+    print(f"Marker ID {marker_id} saved as {marker_path}")
 
 print("Markers generated and saved.")
 
-def overlay_image_on_frame(background, overlay, x, y):
-    """ Overlay `overlay` image on `background` image at position (x, y) """
-    bg_height, bg_width = background.shape[:2]
+def overlay_image_on_frame(background, overlay, dst_pts):
+    """ Overlay `overlay` image on `background` image using the provided destination points """
     overlay_height, overlay_width = overlay.shape[:2]
+    src_pts = np.array([[0, 0], [overlay_width, 0], [overlay_width, overlay_height], [0, overlay_height]])
 
-    if x >= bg_width or y >= bg_height:
-        return background
+    # Perspective transform
+    matrix, _ = cv2.findHomography(src_pts, dst_pts)
+    warped_overlay = cv2.warpPerspective(overlay, matrix, (background.shape[1], background.shape[0]))
 
-    if x + overlay_width > bg_width:
-        overlay_width = bg_width - x
-        overlay = overlay[:, :overlay_width]
-
-    if y + overlay_height > bg_height:
-        overlay_height = bg_height - y
-        overlay = overlay[:overlay_height]
-
-    if overlay.shape[2] == 4:
-        alpha_overlay = overlay[:, :, 3] / 255.0
-        alpha_background = 1.0 - alpha_overlay
-
+    if overlay.shape[2] == 4:  # If overlay has an alpha channel
+        alpha_mask = warped_overlay[:, :, 3] / 255.0
         for c in range(3):
-            background[y:y+overlay_height, x:x+overlay_width, c] = (
-                alpha_overlay * overlay[:, :, c] +
-                alpha_background * background[y:y+overlay_height, x:x+overlay_width, c]
-            )
+            background[:, :, c] = background[:, :, c] * (1 - alpha_mask) + warped_overlay[:, :, c] * alpha_mask
     else:
-        background[y:y+overlay_height, x:x+overlay_width] = overlay
+        mask = warped_overlay.sum(axis=2) > 0  # Binary mask
+        background[mask] = warped_overlay[mask]
 
     return background
 
@@ -137,10 +137,7 @@ while True:
                         print(f"Error loading image at {img_path}")
                         continue
 
-                    top_left = crn[0]
-                    top_right = crn[1]
-                    bottom_right = crn[2]
-                    bottom_left = crn[3]
+                    top_left, top_right, bottom_right, bottom_left = crn
 
                     width = int(np.linalg.norm(top_right - top_left))
                     height = int(np.linalg.norm(top_right - bottom_right))
@@ -148,14 +145,8 @@ while True:
                     # Resize overlay image to fit marker size
                     resized_img = cv2.resize(img, (width, height))
 
-                    # Perspective transform
-                    dst_pts = np.array([top_left, top_right, bottom_right, bottom_left])
-                    src_pts = np.array([[0, 0], [width, 0], [width, height], [0, height]])
-
-                    matrix, _ = cv2.findHomography(src_pts, dst_pts)
-                    warped_img = cv2.warpPerspective(resized_img, matrix, (frame.shape[1], frame.shape[0]))
-
-                    frame = overlay_image_on_frame(frame, warped_img, 0, 0)
+                    # Overlay image on frame
+                    frame = overlay_image_on_frame(frame, resized_img, crn)
 
                     if not sound_played:
                         print(f"Playing sound from {sounds[idx]}")
@@ -172,6 +163,9 @@ while True:
         # Reset sound_played flag when 'r' key is pressed
         for marker_info in media_files.values():
             marker_info["sound_played"] = False
+    elif key & 0xFF == ord('s'):
+        # Stop the currently playing sound when 's' key is pressed
+        stop_audio()
 
 cap.release()
 cv2.destroyAllWindows()
